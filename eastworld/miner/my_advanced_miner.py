@@ -44,16 +44,14 @@ class MyAdvancedAgent(BaseMinerNeuron):
         # --- SLAM Persistence ---
         script_dir = Path(__file__).parent.resolve()
         
-        # Create paths for our data relative to this script's location.
         slam_data_path = script_dir / "slam_data"
-        metadata_filepath = script_dir / "agent_metadata.json"
+        metadata_filepath = script_dir / "agent_metadata.json" # Use this for metadata
         
         bt.logging.info(f"Using portable path for SLAM data: {slam_data_path}")
         bt.logging.info(f"Using portable path for metadata: {metadata_filepath}")
         
         # --- SLAM Persistence ---
-        # ### CORRECTED ###
-        # Convert the Path object to a string to match the expected type.
+        # Using the portable path for SLAM is correct.
         self.slam = ISAM(data_dir=str(slam_data_path))
         bt.logging.info("SLAM module initialized.")
         try:
@@ -83,7 +81,7 @@ class MyAdvancedAgent(BaseMinerNeuron):
         # This logic is also correct and now uses the fixed memory class.
         self.goals = ["Explore the crashed spacecraft and identify the needs of the survivors."]
         self.plan = []
-        self.memory = JSONFileMemory(filepath=os.path.join(self.config.full_path, "agent_metadata.json"))
+        self.memory = JSONFileMemory(filepath=str(metadata_filepath))
         loaded_memory = self.memory.load()
         if loaded_memory:
             self.goals = loaded_memory.get("goals", self.goals)
