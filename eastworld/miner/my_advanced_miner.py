@@ -2,12 +2,13 @@ import bittensor as bt
 from collections import deque
 from typing import TypedDict
 
-
+import os
 from eastworld.base.miner import BaseMinerNeuron
 from eastworld.protocol import Observation
 from eastworld.miner.slam.isam import ISAM2 as ISAM
 # Import LangGraph to build our state machine
 from langgraph.graph import StateGraph, END
+from eastworld.miner.memory import JSONFileMemory
 
 class AgentState(TypedDict):
     observation: Observation       # The raw data from the validator
@@ -25,41 +26,69 @@ class MyAdvancedAgent(BaseMinerNeuron):
     """
     def __init__(self):
         super().__init__() # Make sure to call the parent class constructor
-        self.slam = ISAM()
-        bt.logging.info("SLAM module initialized.")
+        slam_data_path = os.path.join(self.config.full_path, "slam_data")
 
-        # === Define the State Machine Graph ===
+        self.slam = ISAM(data_dir=slam_data_path)
+        bt.logging.info("SLAM module initialized.")
+        try:
+            self.slam.load(load_path=slam_data_path)
+        except FileNotFoundError:
+             bt.logging.warning("SLAM data directory not found. Starting with a fresh SLAM map.")
+        except Exception as e:
+            bt.logging.error(f"An unexpected error occurred loading SLAM data: {e}")
+
+
+        # --- Metadata Persistence ---
+        # 1. Initialize the memory module for goals and plans.
+        self.memory = JSONFileMemory(filepath=os.path.join(self.config.full_path, "agent_metadata.json"))
+        # 2. Load the metadata.
+        self.goals = ["Explore the area and survive."]
+        self.plan = []
+        loaded_metadata = self.memory.load()
+        if loaded_metadata:
+            self.goals = loaded_metadata.get("goals", self.goals)
+            self.plan = loaded_metadata.get("plan", self.plan)
+
         workflow = StateGraph(AgentState)
         workflow.add_node("update_map", self.update_map)
         workflow.add_node("objective_reevaluation", self.objective_reevaluation)
         workflow.add_node("action_selection", self.action_selection)
         workflow.add_node("after_action_review", self.after_action_review)
-
-        # 2. Define the Edges (the "transitions" between states)
+        workflow.add_node("save_memory", self.save_memory)
         workflow.set_entry_point("update_map")
-        workflow.add_edge("update_map", "objective_reevaluation") 
+        workflow.add_edge("update_map", "objective_reevaluation")
         workflow.add_edge("objective_reevaluation", "action_selection")
         workflow.add_edge("action_selection", "after_action_review")
-        workflow.add_edge("after_action_review", END) # The cycle ends here for one turn
-
-# After updating the map, re-evaluate goals
-
-        # 3. Compile the graph
+        workflow.add_edge("after_action_review", "save_memory")
+        workflow.add_edge("save_memory", END)
         self.app = workflow.compile()
-        bt.logging.info("Advanced agent state machine compiled successfully.")
+        bt.logging.info("Advanced agent with corrected persistent memory compiled.")
 
     # --- These methods are the nodes of our graph ---
     def update_map(self, state: AgentState) -> AgentState:
         """
-        Node 0 (New): Update the SLAM map with the latest sensor data.
+        ### MODIFIED ###
+        The ISAM2 class has a `run_iteration` method that does everything.
+        It updates the pose, updates GTSAM, and updates the grid map.
+        We should use that instead of calling update_map directly.
         """
-        bt.logging.info("🗺️ Updating SLAM map...")
-        observation = state['observation']
-        if observation.odometry and observation.odometry[0] > 0:
-            distance, direction = observation.odometry
-            self.slam.run_iteration(observation.lidar, distance, direction)
-        # The slam object is part of the class, so we don't need to return it here.
-        # The other nodes can access it via `self.slam`.
+        bt.logging.info("🗺️ Running SLAM iteration...")
+        obs = state['observation']
+        # The run_iteration method handles odometry and lidar processing.
+        # We need to extract the distance and direction from the odometry log.
+        # This is a placeholder, as the exact format of odometry_log isn't defined in protocol.py
+        # Let's assume the log is like: "Moved 100cm to the north."
+        try:
+            last_move = obs.action_log[-1] if obs.action_log else "Moved 0cm to the east"
+            parts = last_move.replace("Moved ", "").replace("cm to the ", " ").split()
+            distance = float(parts[0])
+            direction = parts[1]
+            self.slam.run_iteration(obs.lidar, distance, direction)
+        except Exception as e:
+            bt.logging.error(f"Could not parse odometry or run SLAM iteration: {e}")
+            # Fallback to just updating the map if run_iteration fails
+            self.slam._update_grid_map(self.slam.current_pose, obs.lidar)
+            
         return state
     
     def objective_reevaluation(self, state: AgentState) -> AgentState:
@@ -73,28 +102,27 @@ class MyAdvancedAgent(BaseMinerNeuron):
         return state
 
     def action_selection(self, state: AgentState) -> AgentState:
-        bt.logging.info("🤔 Selecting action...")
-        
-        # ### SLAM ###
-        # Now we can make smarter decisions using our position from the SLAM map.
-        current_pose = self.slam.get_current_pose() # This is our (x, y, theta) position
-        bt.logging.info(f"Current agent pose from SLAM: {current_pose}")
-
-        # Example of smarter logic:
-        # If we have a goal location, we can calculate the direction.
-        # For now, we'll just log the pose and use the same simple logic as before.
-        # In a future step, we would use this pose to navigate towards a goal.
-        
+        current_x, current_y, current_theta = self.slam.get_current_pose()
+        bt.logging.info(f"🤔 Selecting action... Current pose: ({current_x:.2f}, {current_y:.2f})")
         available_actions = state['observation'].available_actions
         chosen_action = '{"tool_name": "move_forward", "tool_args": {}}'
-        
         if available_actions:
             chosen_action = available_actions[0]
         state["action"]=chosen_action
         return state
       
 
-
+    def save_memory(self, state: AgentState) -> AgentState:
+        """### MODIFIED ###
+        This node now orchestrates two separate save operations.
+        """
+        bt.logging.info("💾 Saving all memories...")
+        # 1. Tell the SLAM module to save itself to its dedicated directory.
+        self.slam.save(save_path=self.slam.data_dir)
+        # 2. Tell the metadata memory module to save the other info.
+        self.memory.save(goals=self.goals, plan=self.plan)
+        return state
+    
     def after_action_review(self, state: AgentState) -> AgentState:
         """
         Node 3: Review the result of the last action and reflect on it.
