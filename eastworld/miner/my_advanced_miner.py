@@ -1,31 +1,44 @@
 import bittensor as bt
 from collections import deque
 from typing import TypedDict
-
+import operator
 import os
-from eastworld.base.miner import BaseMinerNeuron
+
+# Base classes and protocol
+from eastworld.base.miner import BaseMiner
 from eastworld.protocol import Observation
-from eastworld.miner.slam.isam import ISAM2 as ISAM
-# Import LangGraph to build our state machine
+
+# LangGraph state machine
 from langgraph.graph import StateGraph, END
+
+# SLAM and Memory modules
+from eastworld.miner.slam.isam import ISAM2 as ISAM
 from eastworld.miner.memory import JSONFileMemory
 
-class AgentState(TypedDict):
-    observation: Observation       # The raw data from the validator
-    plan: list[str]                # The agent's long-term plan
-    goals: list[str]               # The agent's high-level goals
-    reflection: str                # The agent's reflection on its last action
-    action: str                    # The chosen action to execute
-    action_log: deque[str]
-    slam: ISAM       
+# ### REASONING ###
+# Import our new prompt loader
+from eastworld.miner.prompts import load_prompt
+# Import LangChain components to interact with an LLM
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 
-class MyAdvancedAgent(BaseMinerNeuron):
+class AgentState(TypedDict):
+    observation: Observation
+    plan: list[str]
+    goals: list[str]
+    reflection: str
+    action: str
+    action_log: deque[str]
+    slam: ISAM
+
+class MyAdvancedAgent(BaseMiner):
     """
-    This is our advanced agent. It uses a LangGraph state machine to drive its behavior,
-    making it more robust and intelligent than a simple loop-based agent.
+    The final version of our agent: state machine, SLAM, persistent memory,
+    and an LLM-powered cognitive cycle.
     """
     def __init__(self):
-        super().__init__() # Make sure to call the parent class constructor
+        super().__init__()
         slam_data_path = os.path.join(self.config.full_path, "slam_data")
 
         self.slam = ISAM(data_dir=slam_data_path)
@@ -40,31 +53,60 @@ class MyAdvancedAgent(BaseMinerNeuron):
 
         # --- Metadata Persistence ---
         # 1. Initialize the memory module for goals and plans.
-        self.memory = JSONFileMemory(filepath=os.path.join(self.config.full_path, "agent_metadata.json"))
-        # 2. Load the metadata.
-        self.goals = ["Explore the area and survive."]
-        self.plan = []
-        loaded_metadata = self.memory.load()
-        if loaded_metadata:
-            self.goals = loaded_metadata.get("goals", self.goals)
-            self.plan = loaded_metadata.get("plan", self.plan)
 
+        # ### REASONING ###
+        # Initialize the LLM. You must have OPENAI_API_KEY set in your environment.
+        # We use a powerful model for reasoning.
+        try:
+            self.llm = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0.2)
+        except Exception as e:
+            bt.logging.error(f"Failed to initialize LLM. Make sure OPENAI_API_KEY is set. Error: {e}")
+            # Exit if LLM is not available, as the agent cannot function.
+            exit(1)
+
+        # Load the specialized prompts
+        self.objective_prompt = load_prompt('senior_objective_reevaluation')
+        self.action_prompt = load_prompt('senior_action_selection')
+        self.review_prompt = load_prompt('senior_after_action_review')
+
+        # Create LangChain "chains" for each cognitive step.
+        # A chain combines a prompt, a model, and an output parser.
+        self.objective_chain = ChatPromptTemplate.from_template(self.objective_prompt) | self.llm | JsonOutputParser()
+        self.action_chain = ChatPromptTemplate.from_template(self.action_prompt) | self.llm | JsonOutputParser()
+        self.review_chain = ChatPromptTemplate.from_template(self.review_prompt) | self.llm | StrOutputParser()
+        
+        # Initialize Memory and SLAM
+        self.goals = ["Explore the crashed spacecraft and identify the needs of the survivors."]
+        self.plan = []
+
+        self.memory = JSONFileMemory(filepath=os.path.join(self.config.full_path, "agent_metadata.json"))
+
+        loaded_memory = self.memory.load()
+        if loaded_memory:
+            self.goals = loaded_memory.get("goals", self.goals)
+            self.plan = loaded_memory.get("plan", self.plan)
+
+
+        # Define the State Machine Graph
         workflow = StateGraph(AgentState)
         workflow.add_node("update_map", self.update_map)
         workflow.add_node("objective_reevaluation", self.objective_reevaluation)
         workflow.add_node("action_selection", self.action_selection)
         workflow.add_node("after_action_review", self.after_action_review)
         workflow.add_node("save_memory", self.save_memory)
+        
         workflow.set_entry_point("update_map")
         workflow.add_edge("update_map", "objective_reevaluation")
         workflow.add_edge("objective_reevaluation", "action_selection")
         workflow.add_edge("action_selection", "after_action_review")
         workflow.add_edge("after_action_review", "save_memory")
         workflow.add_edge("save_memory", END)
-        self.app = workflow.compile()
-        bt.logging.info("Advanced agent with corrected persistent memory compiled.")
 
-    # --- These methods are the nodes of our graph ---
+        self.app = workflow.compile()
+        bt.logging.info("Fully intelligent agent compiled and ready.")
+
+    # --- Graph Nodes ---
+    
     def update_map(self, state: AgentState) -> AgentState:
         """
         ### MODIFIED ###
@@ -90,15 +132,22 @@ class MyAdvancedAgent(BaseMinerNeuron):
             self.slam._update_grid_map(self.slam.current_pose, obs.lidar)
             
         return state
-    
+
     def objective_reevaluation(self, state: AgentState) -> AgentState:
-        """
-        Node 1: Look at the current situation and decide if the goals are still valid.
-        For now, we'll keep it simple. In the future, this will use an LLM.
-        """
-        bt.logging.info("🔍 Re-evaluating objectives...")
-        # In a real implementation, you would use an LLM with a specific prompt here.
-        # For now, we'll just pass the state through.
+        bt.logging.info("🔍 Re-evaluating objectives with LLM...")
+        try:
+            response = self.objective_chain.invoke({
+                "goals": self.goals,
+                "plan": self.plan,
+                "observation": state['observation'].perception,
+            })
+            self.goals = response.get("goals", self.goals)
+            self.plan = response.get("plan", self.plan)
+            bt.logging.info(f"LLM updated goals: {self.goals}")
+        except Exception as e:
+            bt.logging.error(f"LLM call failed in objective re-evaluation: {e}")
+        state['goals'] = self.goals
+        state['plan'] = self.plan
         return state
 
     def action_selection(self, state: AgentState) -> AgentState:
@@ -124,34 +173,30 @@ class MyAdvancedAgent(BaseMinerNeuron):
         return state
     
     def after_action_review(self, state: AgentState) -> AgentState:
-        """
-        Node 3: Review the result of the last action and reflect on it.
-        """
-        bt.logging.info("🧐 Reviewing last action...")
-        last_action_result = state['observation'].action_log[-1] # Get the most recent log
-        
-        # Here you would use an LLM with a prompt like "senior_after_action_review.txt"
-        # to generate a reflection.
-        reflection = f"I just did '{state['action']}' and the result was '{last_action_result}'. I should continue with the plan."
-        
+        bt.logging.info("🧐 Reviewing last action with LLM...")
+        try:
+            reflection = self.review_chain.invoke({
+                "goals": self.goals,
+                "plan": self.plan,
+                "action": state['action'],
+                "outcome": state['observation'].action_log[-1]
+            })
+            bt.logging.info(f"LLM reflection: {reflection}")
+        except Exception as e:
+            bt.logging.error(f"LLM call failed in action review: {e}")
+            reflection = "Reflection failed due to an error."
         state['reflection'] = reflection
         return state
 
 
-    # This is the main entry point called by the Bittensor network
-    async def forward(self, observation: Observation) -> str:
-        """
-        This function is called by the validator. It receives the observation,
-        runs it through our state machine, and returns the chosen action.
-        """
-        bt.logging.info("Forward call received, invoking state machine.")
-        
-        # 1. Initialize the state for this run
 
+    async def forward(self, observation: Observation) -> str:
+        bt.logging.info("Forward call received, invoking full cognitive cycle.")
+        
         initial_state: AgentState = {
             "observation": observation,
-            "plan": [],
-            "goals": ["Explore the area and survive."],
+            "plan": self.plan,
+            "goals": self.goals,
             "reflection": "",
             "action": "",
             "action_log": deque(observation.action_log, maxlen=50),
@@ -160,9 +205,5 @@ class MyAdvancedAgent(BaseMinerNeuron):
             "slam": self.slam,
         }
 
-        # 2. Run the state machine
         final_state = self.app.invoke(initial_state)
-
-        # 3. Return the action chosen by the "action_selection" node
-        bt.logging.info(f"State machine finished. Chosen action: {final_state['action']}")
         return final_state['action']
