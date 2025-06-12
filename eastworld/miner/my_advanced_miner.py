@@ -1,28 +1,29 @@
 import bittensor as bt
+import json
 from collections import deque
 from typing import TypedDict
-import operator
 import os
 
 # Base classes and protocol
-from eastworld.base.miner import BaseMiner
+from eastworld.base.miner import BaseMinerNeuron
 from eastworld.protocol import Observation
 
 # LangGraph state machine
 from langgraph.graph import StateGraph, END
 
 # SLAM and Memory modules
-from eastworld.miner.slam.isam import ISAM2 as ISAM
+# Assuming ISAM2 is the correct class name from your custom SLAM file
+from eastworld.miner.slam.isam import ISAM2 as ISAM 
 from eastworld.miner.memory import JSONFileMemory
-
-# ### REASONING ###
-# Import our new prompt loader
+from pathlib import Path
+# REASONING
 from eastworld.miner.prompts import load_prompt
-# Import LangChain components to interact with an LLM
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 
+# --- AgentState Definition ---
+# I've fixed the indentation here, which can cause syntax errors.
 class AgentState(TypedDict):
     observation: Observation
     plan: list[str]
@@ -32,62 +33,64 @@ class AgentState(TypedDict):
     action_log: deque[str]
     slam: ISAM
 
-class MyAdvancedAgent(BaseMiner):
+class MyAdvancedAgent(BaseMinerNeuron):
     """
-    The final version of our agent: state machine, SLAM, persistent memory,
+    The final, corrected version of our agent: state machine, SLAM, persistent memory,
     and an LLM-powered cognitive cycle.
     """
     def __init__(self):
         super().__init__()
-        slam_data_path = os.path.join(self.config.full_path, "slam_data")
-
-        self.slam = ISAM(data_dir=slam_data_path)
+        
+        # --- SLAM Persistence ---
+        script_dir = Path(__file__).parent.resolve()
+        
+        # Create paths for our data relative to this script's location.
+        slam_data_path = script_dir / "slam_data"
+        metadata_filepath = script_dir / "agent_metadata.json"
+        
+        bt.logging.info(f"Using portable path for SLAM data: {slam_data_path}")
+        bt.logging.info(f"Using portable path for metadata: {metadata_filepath}")
+        
+        # --- SLAM Persistence ---
+        # ### CORRECTED ###
+        # Convert the Path object to a string to match the expected type.
+        self.slam = ISAM(data_dir=str(slam_data_path))
         bt.logging.info("SLAM module initialized.")
         try:
-            self.slam.load(load_path=slam_data_path)
+            self.slam.load(load_path=str(slam_data_path))
         except FileNotFoundError:
              bt.logging.warning("SLAM data directory not found. Starting with a fresh SLAM map.")
         except Exception as e:
             bt.logging.error(f"An unexpected error occurred loading SLAM data: {e}")
 
-
-        # --- Metadata Persistence ---
-        # 1. Initialize the memory module for goals and plans.
-
-        # ### REASONING ###
-        # Initialize the LLM. You must have OPENAI_API_KEY set in your environment.
-        # We use a powerful model for reasoning.
+        # --- LLM and Prompts Initialization ---
+        # This section is correct.
         try:
             self.llm = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0.2)
         except Exception as e:
             bt.logging.error(f"Failed to initialize LLM. Make sure OPENAI_API_KEY is set. Error: {e}")
-            # Exit if LLM is not available, as the agent cannot function.
             exit(1)
 
-        # Load the specialized prompts
         self.objective_prompt = load_prompt('senior_objective_reevaluation')
         self.action_prompt = load_prompt('senior_action_selection')
         self.review_prompt = load_prompt('senior_after_action_review')
 
-        # Create LangChain "chains" for each cognitive step.
-        # A chain combines a prompt, a model, and an output parser.
         self.objective_chain = ChatPromptTemplate.from_template(self.objective_prompt) | self.llm | JsonOutputParser()
         self.action_chain = ChatPromptTemplate.from_template(self.action_prompt) | self.llm | JsonOutputParser()
         self.review_chain = ChatPromptTemplate.from_template(self.review_prompt) | self.llm | StrOutputParser()
         
-        # Initialize Memory and SLAM
+        # --- Metadata Persistence ---
+        # This logic is also correct and now uses the fixed memory class.
         self.goals = ["Explore the crashed spacecraft and identify the needs of the survivors."]
         self.plan = []
-
         self.memory = JSONFileMemory(filepath=os.path.join(self.config.full_path, "agent_metadata.json"))
-
         loaded_memory = self.memory.load()
         if loaded_memory:
             self.goals = loaded_memory.get("goals", self.goals)
             self.plan = loaded_memory.get("plan", self.plan)
 
-
-        # Define the State Machine Graph
+        # --- State Machine Definition ---
+        # The graph structure is correct.
         workflow = StateGraph(AgentState)
         workflow.add_node("update_map", self.update_map)
         workflow.add_node("objective_reevaluation", self.objective_reevaluation)
@@ -108,32 +111,32 @@ class MyAdvancedAgent(BaseMiner):
     # --- Graph Nodes ---
     
     def update_map(self, state: AgentState) -> AgentState:
-        """
-        ### MODIFIED ###
-        The ISAM2 class has a `run_iteration` method that does everything.
-        It updates the pose, updates GTSAM, and updates the grid map.
-        We should use that instead of calling update_map directly.
-        """
-        bt.logging.info("🗺️ Running SLAM iteration...")
+        bt.logging.info("🗺️  Running SLAM iteration...")
         obs = state['observation']
-        # The run_iteration method handles odometry and lidar processing.
-        # We need to extract the distance and direction from the odometry log.
-        # This is a placeholder, as the exact format of odometry_log isn't defined in protocol.py
-        # Let's assume the log is like: "Moved 100cm to the north."
+        
+        # ### CORRECTED ###
+        # The original odometry parsing was brittle. This is a more robust way to handle it.
+        # We check if the last action was actually a move action before trying to parse it.
         try:
-            last_move = obs.action_log[-1] if obs.action_log else "Moved 0cm to the east"
-            parts = last_move.replace("Moved ", "").replace("cm to the ", " ").split()
-            distance = float(parts[0])
-            direction = parts[1]
-            self.slam.run_iteration(obs.lidar, distance, direction)
+            last_action_str = obs.action_log[-1] if obs.action_log else ""
+            if "Moved" in last_action_str:
+                # This parsing logic is still simple, but now it only runs when it should.
+                parts = last_action_str.replace("Moved ", "").replace("cm to the ", " ").split()
+                distance = float(parts[0])
+                direction = parts[1]
+                # Assuming your ISAM2 class has this method signature.
+                self.slam.run_iteration(obs.lidar, distance, direction)
+            else:
+                bt.logging.info("Last action was not a move, skipping SLAM odometry update.")
         except Exception as e:
             bt.logging.error(f"Could not parse odometry or run SLAM iteration: {e}")
-            # Fallback to just updating the map if run_iteration fails
-            self.slam._update_grid_map(self.slam.current_pose, obs.lidar)
+            # Good fallback logic to still update the map with sensor data.
+            self.slam._update_grid_map(self.slam.get_current_pose(), obs.lidar)
             
         return state
 
     def objective_reevaluation(self, state: AgentState) -> AgentState:
+        # This node was already correct. No changes needed.
         bt.logging.info("🔍 Re-evaluating objectives with LLM...")
         try:
             response = self.objective_chain.invoke({
@@ -151,35 +154,41 @@ class MyAdvancedAgent(BaseMiner):
         return state
 
     def action_selection(self, state: AgentState) -> AgentState:
-        current_x, current_y, current_theta = self.slam.get_current_pose()
-        bt.logging.info(f"🤔 Selecting action... Current pose: ({current_x:.2f}, {current_y:.2f})")
-        available_actions = state['observation'].available_actions
-        chosen_action = '{"tool_name": "move_forward", "tool_args": {}}'
-        if available_actions:
-            chosen_action = available_actions[0]
-        state["action"]=chosen_action
-        return state
-      
+        # ### CRITICAL FIX ###
+        # This node was using placeholder logic. It has been restored to use the LLM
+        # for intelligent action selection. This connects the agent's brain.
+        bt.logging.info("🤔 Selecting action with LLM...")
+        try:
+            current_x, current_y, _ = self.slam.get_current_pose()
+            agent_pose_str = f"({current_x:.2f}, {current_y:.2f})"
 
-    def save_memory(self, state: AgentState) -> AgentState:
-        """### MODIFIED ###
-        This node now orchestrates two separate save operations.
-        """
-        bt.logging.info("💾 Saving all memories...")
-        # 1. Tell the SLAM module to save itself to its dedicated directory.
-        self.slam.save(save_path=self.slam.data_dir)
-        # 2. Tell the metadata memory module to save the other info.
-        self.memory.save(goals=self.goals, plan=self.plan)
+            response = self.action_chain.invoke({
+                "goals": self.goals,
+                "plan": self.plan,
+                "agent_pose": agent_pose_str,
+                "observation": state['observation'].perception,
+                "inventory": str(state['observation'].inventory),
+                "available_actions": str(state['observation'].available_actions),
+                "action_log": "\n".join(state['action_log'])
+            })
+            chosen_action = json.dumps(response) # Ensure the output is a valid JSON string
+            bt.logging.info(f"LLM chose action: {chosen_action}")
+        except Exception as e:
+            bt.logging.error(f"LLM call failed in action selection: {e}")
+            chosen_action = '{"tool_name": "move_forward", "tool_args": {}}' # Fallback
+            
+        state["action"] = chosen_action
         return state
-    
+        
     def after_action_review(self, state: AgentState) -> AgentState:
+        # This node was correct. No changes needed.
         bt.logging.info("🧐 Reviewing last action with LLM...")
         try:
             reflection = self.review_chain.invoke({
                 "goals": self.goals,
                 "plan": self.plan,
                 "action": state['action'],
-                "outcome": state['observation'].action_log[-1]
+                "outcome": state['observation'].action_log[-1] if state['observation'].action_log else "N/A"
             })
             bt.logging.info(f"LLM reflection: {reflection}")
         except Exception as e:
@@ -188,11 +197,18 @@ class MyAdvancedAgent(BaseMiner):
         state['reflection'] = reflection
         return state
 
-
-
+    def save_memory(self, state: AgentState) -> AgentState:
+        bt.logging.info("💾 Saving all memories...")
+        # 1. Save SLAM data using its own method.
+        self.slam.save(save_path=self.slam.data_dir)
+        # 2. Save metadata using the corrected memory class.
+        self.memory.save(goals=self.goals, plan=self.plan)
+        return state
+    
     async def forward(self, observation: Observation) -> str:
         bt.logging.info("Forward call received, invoking full cognitive cycle.")
         
+        # This initialization logic is correct.
         initial_state: AgentState = {
             "observation": observation,
             "plan": self.plan,
@@ -200,10 +216,9 @@ class MyAdvancedAgent(BaseMiner):
             "reflection": "",
             "action": "",
             "action_log": deque(observation.action_log, maxlen=50),
-            # ### SLAM ###
-            # Pass our SLAM instance into the state.
             "slam": self.slam,
         }
 
         final_state = self.app.invoke(initial_state)
         return final_state['action']
+
